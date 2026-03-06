@@ -7,12 +7,16 @@ package main
 // go build -buildmode=plugin rtiming.go
 //
 
-import "../mr"
-import "fmt"
-import "os"
-import "syscall"
-import "time"
-import "io/ioutil"
+import (
+	"fmt"
+	"io/ioutil"
+	"log"
+	"os"
+	"syscall"
+	"time"
+
+	"../mr"
+)
 
 func nparallel(phase string) int {
 	// create a file so that other workers will see that
@@ -23,7 +27,7 @@ func nparallel(phase string) int {
 	if err != nil {
 		panic(err)
 	}
-
+	log.Printf("worker %v created file %v", pid, myfilename)
 	// are any other workers running?
 	// find their PIDs by scanning directory for mr-worker-XXX files.
 	dd, err := os.Open(".")
@@ -55,7 +59,7 @@ func nparallel(phase string) int {
 	if err != nil {
 		panic(err)
 	}
-
+	log.Printf("returning %v for phase %v", ret, phase)
 	return ret
 }
 

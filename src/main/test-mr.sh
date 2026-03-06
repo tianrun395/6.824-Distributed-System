@@ -132,6 +132,7 @@ wait ; wait
 echo '***' Starting reduce parallelism test.
 
 rm -f mr-out* mr-worker*
+rm -f mr-*
 
 timeout -k 2s 180s ../mrmaster ../pg*txt &
 sleep 1
@@ -151,7 +152,7 @@ fi
 
 wait ; wait
 
-
+rm -f mr-*
 # generate the correct output
 ../mrsequential ../../mrapps/nocrash.so ../pg*txt || exit 1
 sort mr-out-0 > mr-correct-crash.txt
