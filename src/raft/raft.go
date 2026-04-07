@@ -18,7 +18,6 @@ package raft
 //
 
 import (
-	"fmt"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -88,7 +87,8 @@ type Raft struct {
 // return currentTerm and whether this server
 // believes it is the leader.
 func (rf *Raft) GetState() (int, bool) {
-	// Your code here (2A).
+	rf.mu.Lock()
+	defer rf.mu.Unlock()
 	return rf.currentTerm, rf.state == Leader
 }
 
@@ -316,6 +316,10 @@ func (rf *Raft) killed() bool {
 func (rf *Raft) startElection(shouldStartHeartbeat chan bool) {
 	// start election
 	rf.mu.Lock()
+	if rf.state == Leader {
+		rf.mu.Unlock()
+		return
+	}
 	rf.currentTerm++
 	termWhenStartElection := rf.currentTerm
 	rf.votedFor = rf.me
@@ -339,11 +343,15 @@ func (rf *Raft) startElection(shouldStartHeartbeat chan bool) {
 				LastLogIndex: lastLogIndex,
 				LastLogTerm:  lastLogTerm,
 			}, reply)
+			rf.mu.Lock()
+			defer rf.mu.Unlock()
+			defer cond.Broadcast()
+
+			finished++
 			if !ok {
-				fmt.Printf("Failed to send request vote to peer %d \n", i)
 				return
 			}
-			rf.mu.Lock()
+
 			if reply.Term > rf.currentTerm {
 				rf.currentTerm = reply.Term
 				rf.votedFor = -1
@@ -353,18 +361,15 @@ func (rf *Raft) startElection(shouldStartHeartbeat chan bool) {
 			if reply.VoteGranted && rf.state == Candidate && rf.currentTerm == termWhenStartElection {
 				voteReceived++
 			}
-			finished++
-			cond.Broadcast()
-			rf.mu.Unlock()
 		}(termWhenStartElection, i)
 	}
 	rf.mu.Lock()
-	for voteReceived <= len(rf.peers)/2 && finished < len(rf.peers) {
+	for voteReceived <= len(rf.peers)/2 && finished < len(rf.peers) &&
+		rf.state == Candidate && rf.currentTerm == termWhenStartElection {
 		cond.Wait()
 	}
 	if voteReceived > len(rf.peers)/2 && rf.state == Candidate && rf.currentTerm == termWhenStartElection {
 		// become leader
-		fmt.Printf("Server %d elected as leader at term %d, voteReceived: %d, rf.peers: %d \n", rf.me, rf.currentTerm, voteReceived, len(rf.peers))
 		rf.state = Leader
 		// reinitialize nextIndex and matchIndex after election
 		for i := 0; i < len(rf.peers); i++ {
@@ -388,7 +393,7 @@ func (rf *Raft) electionLoop(shouldStartHeartbeat chan bool) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		go rf.startElection(shouldStartHeartbeat)
+		rf.startElection(shouldStartHeartbeat)
 	}
 }
 
