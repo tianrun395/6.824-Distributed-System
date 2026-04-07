@@ -326,7 +326,6 @@ func (rf *Raft) startElection(shouldStartHeartbeat chan bool) {
 	rf.state = Candidate
 	lastLogIndex := len(rf.log) - 1
 	lastLogTerm := rf.log[lastLogIndex].Term
-	rf.resetElectionTimer()
 	rf.mu.Unlock()
 	voteReceived := 1
 	finished := 1
@@ -346,7 +345,6 @@ func (rf *Raft) startElection(shouldStartHeartbeat chan bool) {
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
 			defer cond.Broadcast()
-
 			finished++
 			if !ok {
 				return
@@ -393,7 +391,8 @@ func (rf *Raft) electionLoop(shouldStartHeartbeat chan bool) {
 			time.Sleep(50 * time.Millisecond)
 			continue
 		}
-		rf.startElection(shouldStartHeartbeat)
+		rf.resetElectionTimer()
+		go rf.startElection(shouldStartHeartbeat)
 	}
 }
 
