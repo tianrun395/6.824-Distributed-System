@@ -71,6 +71,7 @@ type Raft struct {
 	log         []LogEntry
 	commitIndex int
 	lastApplied int
+	applyCh     chan ApplyMsg
 
 	// candidate state
 	state int // 0 for follower, 1 for candidate, 2 for leader
@@ -252,7 +253,9 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 
 	for i, entry := range args.Entries {
 		if len(rf.log) > args.PrevLogIndex+1+i {
-			if rf.log[args.PrevLogIndex+1+i].Term != entry.Term {
+			if rf.log[args.PrevLogIndex+1+i].Term == entry.Term {
+				continue
+			} else {
 				rf.log = rf.log[:args.PrevLogIndex+1+i]
 				rf.log = append(rf.log, entry)
 			}
@@ -260,6 +263,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			rf.log = append(rf.log, entry)
 		}
 	}
+
 	if args.LeaderCommit > rf.commitIndex {
 		rf.commitIndex = min(args.LeaderCommit, len(rf.log)-1)
 	}
@@ -286,12 +290,76 @@ func (rf *Raft) sendAppendEntries(server int, args *AppendEntriesArgs, reply *Ap
 // the leader.
 func (rf *Raft) Start(command interface{}) (int, int, bool) {
 	index := -1
-	term := -1
-	isLeader := true
 
 	// Your code here (2B).
+	rf.mu.Lock()
+	term := rf.currentTerm
+	if rf.state != Leader {
+		rf.mu.Unlock()
+		return index, term, false
+	}
+	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
+	index = len(rf.log) - 1
+	rf.matchIndex[rf.me] = index
+	rf.nextIndex[rf.me] = index + 1
+	rf.mu.Unlock()
+	go func() {
+		for i := 0; i < len(rf.peers); i++ {
+			if i == rf.me {
+				continue
+			}
+			go rf.replicateToPeer(i)
+		}
+	}()
+	return index, term, true
+}
 
-	return index, term, isLeader
+func (rf *Raft) replicateToPeer(i int) {
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.state != Leader || rf.nextIndex[i] >= len(rf.log) {
+			rf.mu.Unlock()
+			return
+		}
+		term := rf.currentTerm
+		prevIndex := rf.nextIndex[i] - 1
+		prevTerm := rf.log[prevIndex].Term
+		entries := make([]LogEntry, len(rf.log)-rf.nextIndex[i])
+		copy(entries, rf.log[rf.nextIndex[i]:])
+		commitIndex := rf.commitIndex
+		rf.mu.Unlock()
+		reply := &AppendEntriesReply{}
+		ok := rf.sendAppendEntries(i, &AppendEntriesArgs{
+			Term:         term,
+			LeaderId:     rf.me,
+			PrevLogIndex: prevIndex,
+			PrevLogTerm:  prevTerm,
+			Entries:      entries,
+			LeaderCommit: commitIndex,
+		}, reply)
+		if !ok {
+			continue
+		}
+		rf.mu.Lock()
+		if reply.Term > rf.currentTerm {
+			rf.currentTerm = reply.Term
+			rf.state = Follower
+			rf.votedFor = -1
+			rf.resetElectionTimer()
+			rf.mu.Unlock()
+			return
+		}
+
+		if reply.Success {
+			rf.matchIndex[i] = prevIndex + len(entries)
+			rf.nextIndex[i] = rf.matchIndex[i] + 1
+			rf.mu.Unlock()
+			break
+		} else {
+			rf.nextIndex[i] = max(1, rf.nextIndex[i]-1)
+			rf.mu.Unlock()
+		}
+	}
 }
 
 // the tester doesn't halt goroutines created by Raft after each test,
@@ -374,9 +442,11 @@ func (rf *Raft) startElection(shouldStartHeartbeat chan bool) {
 			rf.nextIndex[i] = len(rf.log) // rf.log indexed from 1
 			rf.matchIndex[i] = 0
 		}
+		rf.mu.Unlock()
 		shouldStartHeartbeat <- true
+	} else {
+		rf.mu.Unlock()
 	}
-	rf.mu.Unlock()
 }
 
 func (rf *Raft) electionLoop(shouldStartHeartbeat chan bool) {
@@ -388,7 +458,7 @@ func (rf *Raft) electionLoop(shouldStartHeartbeat chan bool) {
 		rf.mu.Unlock()
 		if state == Leader || time.Since(last) < timeout {
 			// not time for election
-			time.Sleep(50 * time.Millisecond)
+			time.Sleep(20 * time.Millisecond)
 			continue
 		}
 		rf.resetElectionTimer()
@@ -439,6 +509,48 @@ func (rf *Raft) heartbeatLoop(shouldStartHeartbeat chan bool) {
 	}
 }
 
+func (rf *Raft) applyEntriesToStateMachine() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.commitIndex > rf.lastApplied {
+			rf.lastApplied++
+			lastApplied := rf.lastApplied
+			command := rf.log[lastApplied].Command
+			rf.mu.Unlock()
+			rf.applyCh <- ApplyMsg{
+				Command:      command,
+				CommandValid: true,
+				CommandIndex: lastApplied,
+			}
+		} else {
+			rf.mu.Unlock()
+			time.Sleep(20 * time.Millisecond)
+		}
+	}
+}
+
+func (rf *Raft) updateLeaderCommitIndex() {
+	for !rf.killed() {
+		rf.mu.Lock()
+		if rf.state == Leader {
+			for i := len(rf.log) - 1; i > rf.commitIndex; i-- {
+				count := 1
+				for j := 0; j < len(rf.peers); j++ {
+					if j != rf.me && rf.matchIndex[j] >= i {
+						count++
+					}
+				}
+				if count > len(rf.peers)/2 && rf.log[i].Term == rf.currentTerm {
+					rf.commitIndex = i
+					break
+				}
+			}
+		}
+		rf.mu.Unlock()
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
 // the service or tester wants to create a Raft server. the ports
 // of all the Raft servers (including this one) are in peers[]. this
 // server's port is peers[me]. all the servers' peers[] arrays
@@ -459,6 +571,7 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.currentTerm = 0
 	rf.commitIndex = 0
 	rf.lastApplied = 0
+	rf.applyCh = applyCh
 	rf.log = make([]LogEntry, 0)
 	rf.log = append(rf.log, LogEntry{Term: 0})
 	rf.matchIndex = make([]int, len(peers))
@@ -475,6 +588,12 @@ func Make(peers []*labrpc.ClientEnd, me int,
 
 	// start a goroutine for heartbeat
 	go rf.heartbeatLoop(shouldStartHeartbeat)
+
+	// start a goroutine for applying committed log entries to state machine
+	go rf.applyEntriesToStateMachine()
+
+	// start a goroutine to check whether to update leader commitIndex
+	go rf.updateLeaderCommitIndex()
 
 	return rf
 }
