@@ -461,7 +461,9 @@ func (rf *Raft) electionLoop(shouldStartHeartbeat chan bool) {
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}
+		rf.mu.Lock()
 		rf.resetElectionTimer()
+		rf.mu.Unlock()
 		go rf.startElection(shouldStartHeartbeat)
 	}
 }
@@ -578,7 +580,9 @@ func Make(peers []*labrpc.ClientEnd, me int,
 	rf.nextIndex = make([]int, len(peers))
 	rf.state = Follower
 	rf.votedFor = -1
+	rf.mu.Lock()
 	rf.resetElectionTimer()
+	rf.mu.Unlock()
 	// initialize from state persisted before a crash
 	rf.readPersist(persister.ReadRaftState())
 
