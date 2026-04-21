@@ -18,6 +18,8 @@ package raft
 //
 
 import (
+	"bytes"
+	"main/labgob"
 	"math/rand"
 	"sync"
 	"sync/atomic"
@@ -98,13 +100,13 @@ func (rf *Raft) GetState() (int, bool) {
 // see paper's Figure 2 for a description of what should be persistent.
 func (rf *Raft) persist() {
 	// Your code here (2C).
-	// Example:
-	// w := new(bytes.Buffer)
-	// e := labgob.NewEncoder(w)
-	// e.Encode(rf.xxx)
-	// e.Encode(rf.yyy)
-	// data := w.Bytes()
-	// rf.persister.SaveRaftState(data)
+	w := new(bytes.Buffer)
+	e := labgob.NewEncoder(w)
+	e.Encode(rf.currentTerm)
+	e.Encode(rf.votedFor)
+	e.Encode(rf.log)
+	data := w.Bytes()
+	rf.persister.SaveRaftState(data)
 }
 
 // restore previously persisted state.
@@ -113,18 +115,21 @@ func (rf *Raft) readPersist(data []byte) {
 		return
 	}
 	// Your code here (2C).
-	// Example:
-	// r := bytes.NewBuffer(data)
-	// d := labgob.NewDecoder(r)
-	// var xxx
-	// var yyy
-	// if d.Decode(&xxx) != nil ||
-	//    d.Decode(&yyy) != nil {
-	//   error...
-	// } else {
-	//   rf.xxx = xxx
-	//   rf.yyy = yyy
-	// }
+	r := bytes.NewBuffer(data)
+	d := labgob.NewDecoder(r)
+	var currentTerm int
+	var votedFor int
+	var log []LogEntry
+	if d.Decode(&currentTerm) != nil ||
+		d.Decode(&votedFor) != nil ||
+		d.Decode(&log) != nil {
+		// error...
+		DPrintf("Decoding persisted state error")
+	} else {
+		rf.currentTerm = currentTerm
+		rf.votedFor = votedFor
+		rf.log = log
+	}
 }
 
 // example RequestVote RPC arguments structure.
@@ -165,6 +170,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1
+		rf.persist()
 		rf.state = Follower
 	}
 	reply.Term = rf.currentTerm
@@ -175,6 +181,7 @@ func (rf *Raft) RequestVote(args *RequestVoteArgs, reply *RequestVoteReply) {
 		rf.votedFor = args.CandidateId
 		reply.VoteGranted = true
 		rf.state = Follower
+		rf.persist()
 		rf.resetElectionTimer()
 	} else {
 		reply.VoteGranted = false
@@ -243,6 +250,7 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 	if args.Term > rf.currentTerm {
 		rf.currentTerm = args.Term
 		rf.votedFor = -1 // only reset votedFor when term increases to avoid voting for multiple candidates in the same term
+		rf.persist()
 	}
 	rf.state = Follower
 	reply.Term = rf.currentTerm
@@ -258,9 +266,11 @@ func (rf *Raft) AppendEntries(args *AppendEntriesArgs, reply *AppendEntriesReply
 			} else {
 				rf.log = rf.log[:args.PrevLogIndex+1+i]
 				rf.log = append(rf.log, entry)
+				rf.persist()
 			}
 		} else {
 			rf.log = append(rf.log, entry)
+			rf.persist()
 		}
 	}
 
@@ -299,6 +309,7 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 		return index, term, false
 	}
 	rf.log = append(rf.log, LogEntry{Command: command, Term: rf.currentTerm})
+	rf.persist()
 	index = len(rf.log) - 1
 	rf.matchIndex[rf.me] = index
 	rf.nextIndex[rf.me] = index + 1
@@ -345,6 +356,7 @@ func (rf *Raft) replicateToPeer(i int) {
 			rf.currentTerm = reply.Term
 			rf.state = Follower
 			rf.votedFor = -1
+			rf.persist()
 			rf.resetElectionTimer()
 			rf.mu.Unlock()
 			return
@@ -391,6 +403,7 @@ func (rf *Raft) startElection(shouldStartHeartbeat chan bool) {
 	rf.currentTerm++
 	termWhenStartElection := rf.currentTerm
 	rf.votedFor = rf.me
+	rf.persist()
 	rf.state = Candidate
 	lastLogIndex := len(rf.log) - 1
 	lastLogTerm := rf.log[lastLogIndex].Term
@@ -422,6 +435,7 @@ func (rf *Raft) startElection(shouldStartHeartbeat chan bool) {
 				rf.currentTerm = reply.Term
 				rf.votedFor = -1
 				rf.state = Follower
+				rf.persist()
 				rf.resetElectionTimer()
 			}
 			if reply.VoteGranted && rf.state == Candidate && rf.currentTerm == termWhenStartElection {
@@ -501,6 +515,7 @@ func (rf *Raft) heartbeatLoop(shouldStartHeartbeat chan bool) {
 						rf.currentTerm = reply.Term
 						rf.state = Follower
 						rf.votedFor = -1
+						rf.persist()
 						rf.resetElectionTimer()
 					}
 					rf.mu.Unlock()
