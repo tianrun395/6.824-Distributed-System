@@ -329,9 +329,12 @@ func (rf *Raft) Start(command interface{}) (int, int, bool) {
 func (rf *Raft) replicateToPeer(i int) {
 	for !rf.killed() {
 		rf.mu.Lock()
-		if rf.state != Leader || rf.nextIndex[i] >= len(rf.log) {
+		if rf.state != Leader {
 			rf.mu.Unlock()
 			return
+		}
+		if rf.nextIndex[i] > len(rf.log) {
+			rf.nextIndex[i] = len(rf.log)
 		}
 		term := rf.currentTerm
 		prevIndex := rf.nextIndex[i] - 1
@@ -479,7 +482,7 @@ func (rf *Raft) electionLoop(shouldStartHeartbeat chan bool) {
 		rf.mu.Lock()
 		rf.resetElectionTimer()
 		rf.mu.Unlock()
-		go rf.startElection(shouldStartHeartbeat)
+		rf.startElection(shouldStartHeartbeat)
 	}
 }
 
@@ -492,35 +495,12 @@ func (rf *Raft) heartbeatLoop(shouldStartHeartbeat chan bool) {
 				rf.mu.Unlock()
 				break
 			}
-			term := rf.currentTerm
-			prevIndex := len(rf.log) - 1
-			prevTerm := rf.log[prevIndex].Term
-			commitIndex := rf.commitIndex
 			rf.mu.Unlock()
 			for i := 0; i < len(rf.peers); i++ {
 				if i == rf.me {
 					continue
 				}
-				go func(i int) {
-					reply := &AppendEntriesReply{}
-					rf.sendAppendEntries(i, &AppendEntriesArgs{
-						Term:         term,
-						LeaderId:     rf.me,
-						PrevLogIndex: prevIndex,
-						PrevLogTerm:  prevTerm,
-						Entries:      make([]LogEntry, 0),
-						LeaderCommit: commitIndex,
-					}, reply)
-					rf.mu.Lock()
-					if reply.Term > rf.currentTerm {
-						rf.currentTerm = reply.Term
-						rf.state = Follower
-						rf.votedFor = -1
-						rf.persist()
-						rf.resetElectionTimer()
-					}
-					rf.mu.Unlock()
-				}(i)
+				go rf.replicateToPeer(i)
 			}
 			time.Sleep(150 * time.Millisecond)
 		}
