@@ -45,6 +45,7 @@ type ApplyMsg struct {
 	CommandValid bool
 	Command      interface{}
 	CommandIndex int
+	CommandTerm  int
 }
 
 type LogEntry struct {
@@ -409,12 +410,14 @@ func (rf *Raft) startElection(shouldStartHeartbeat chan bool) {
 	rf.votedFor = rf.me
 	rf.persist()
 	rf.state = Candidate
+	rf.resetElectionTimer()
 	lastLogIndex := len(rf.log) - 1
 	lastLogTerm := rf.log[lastLogIndex].Term
+	electionStart := rf.lastResetElectionTime
+	electionTimeout := rf.electionTimeout
 	rf.mu.Unlock()
 	voteReceived := 1
 	finished := 1
-	cond := sync.NewCond(&rf.mu)
 	for i := 0; i < len(rf.peers); i++ {
 		if i == rf.me {
 			continue
@@ -429,7 +432,6 @@ func (rf *Raft) startElection(shouldStartHeartbeat chan bool) {
 			}, reply)
 			rf.mu.Lock()
 			defer rf.mu.Unlock()
-			defer cond.Broadcast()
 			finished++
 			if !ok {
 				return
@@ -449,8 +451,11 @@ func (rf *Raft) startElection(shouldStartHeartbeat chan bool) {
 	}
 	rf.mu.Lock()
 	for voteReceived <= len(rf.peers)/2 && finished < len(rf.peers) &&
-		rf.state == Candidate && rf.currentTerm == termWhenStartElection {
-		cond.Wait()
+		rf.state == Candidate && rf.currentTerm == termWhenStartElection &&
+		time.Since(electionStart) < electionTimeout {
+		rf.mu.Unlock()
+		time.Sleep(10 * time.Millisecond)
+		rf.mu.Lock()
 	}
 	if voteReceived > len(rf.peers)/2 && rf.state == Candidate && rf.currentTerm == termWhenStartElection {
 		// become leader
@@ -479,9 +484,6 @@ func (rf *Raft) electionLoop(shouldStartHeartbeat chan bool) {
 			time.Sleep(20 * time.Millisecond)
 			continue
 		}
-		rf.mu.Lock()
-		rf.resetElectionTimer()
-		rf.mu.Unlock()
 		rf.startElection(shouldStartHeartbeat)
 	}
 }
@@ -514,11 +516,13 @@ func (rf *Raft) applyEntriesToStateMachine() {
 			rf.lastApplied++
 			lastApplied := rf.lastApplied
 			command := rf.log[lastApplied].Command
+			commandTerm := rf.log[lastApplied].Term
 			rf.mu.Unlock()
 			rf.applyCh <- ApplyMsg{
 				Command:      command,
 				CommandValid: true,
 				CommandIndex: lastApplied,
+				CommandTerm:  commandTerm,
 			}
 		} else {
 			rf.mu.Unlock()
