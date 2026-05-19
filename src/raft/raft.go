@@ -46,6 +46,7 @@ type ApplyMsg struct {
 	Command      interface{}
 	CommandIndex int
 	CommandTerm  int
+	SnapShot     []byte
 }
 
 type LogEntry struct {
@@ -159,10 +160,6 @@ func (rf *Raft) getLogTerm(index int) int {
 	return rf.log[rf.getLogArrayIndex(index)].Term
 }
 
-func (rf *Raft) getLogEntry(index int) LogEntry {
-	return rf.log[rf.getLogArrayIndex(index)]
-}
-
 // example RequestVote RPC arguments structure.
 // field names must start with capital letters!
 type RequestVoteArgs struct {
@@ -179,6 +176,18 @@ type RequestVoteReply struct {
 	// Your data here (2A).
 	Term        int
 	VoteGranted bool
+}
+
+type InstallSnapshotArgs struct {
+	LeaderTerm        int
+	LeaderId          int
+	LastIncludedIndex int
+	LastIncludedTerm  int
+	Data              []byte
+}
+
+type InstallSnapshotReply struct {
+	Term int
 }
 
 func (rf *Raft) resetElectionTimer() {
@@ -370,7 +379,35 @@ func (rf *Raft) replicateToPeer(i int) {
 			rf.nextIndex[i] = rf.getLastLogIndex() + 1
 		}
 		if rf.nextIndex[i] <= rf.lastIncludedIndex {
-			rf.nextIndex[i] = rf.lastIncludedIndex + 1
+			// leader not have log entry for the append entry RPC for this follower, so need to send InstallSnapshot RPC to this follower to let it catch up.
+			currentTerm := rf.currentTerm
+			lastIncludedIndex := rf.lastIncludedIndex
+			lastIncludedTerm := rf.getLogTerm(rf.lastIncludedIndex)
+			rf.mu.Unlock()
+			reply := &InstallSnapshotReply{}
+			ok := rf.sendInstallSnapshot(i, &InstallSnapshotArgs{
+				LeaderTerm:        currentTerm,
+				LeaderId:          rf.me,
+				LastIncludedIndex: lastIncludedIndex,
+				LastIncludedTerm:  lastIncludedTerm,
+				Data:              rf.persister.ReadSnapshot(),
+			}, reply)
+			rf.mu.Lock()
+			if ok {
+				if reply.Term > rf.currentTerm {
+					rf.currentTerm = reply.Term
+					rf.state = Follower
+					rf.votedFor = -1
+					rf.persist()
+					rf.resetElectionTimer()
+					rf.mu.Unlock()
+					return
+				}
+				rf.matchIndex[i] = lastIncludedIndex
+				rf.nextIndex[i] = lastIncludedIndex + 1
+			}
+			rf.mu.Unlock()
+			continue
 		}
 		term := rf.currentTerm
 		prevIndex := rf.nextIndex[i] - 1
@@ -550,13 +587,14 @@ func (rf *Raft) applyEntriesToStateMachine() {
 		if rf.commitIndex > rf.lastApplied {
 			rf.lastApplied++
 			lastApplied := rf.lastApplied
-			entry := rf.getLogEntry(lastApplied)
+			entry := rf.log[rf.getLogArrayIndex(lastApplied)]
 			rf.mu.Unlock()
 			rf.applyCh <- ApplyMsg{
 				Command:      entry.Command,
 				CommandValid: true,
 				CommandIndex: lastApplied,
 				CommandTerm:  entry.Term,
+				SnapShot:     nil,
 			}
 		} else {
 			rf.mu.Unlock()
@@ -587,7 +625,7 @@ func (rf *Raft) updateLeaderCommitIndex() {
 	}
 }
 
-func (rf *Raft) snapshotAndDiscardLogs(index int, snapshot []byte) {
+func (rf *Raft) SnapshotAndDiscardLogs(index int, snapshot []byte) {
 	rf.mu.Lock()
 	defer rf.mu.Unlock()
 	if index <= rf.lastIncludedIndex || index > rf.getLastLogIndex() {
@@ -603,6 +641,53 @@ func (rf *Raft) snapshotAndDiscardLogs(index int, snapshot []byte) {
 	}
 	rf.persist()
 	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), snapshot)
+}
+
+func (rf *Raft) InstallSnapshot(args *InstallSnapshotArgs, reply *InstallSnapshotReply) {
+	rf.mu.Lock()
+	if args.LeaderTerm < rf.currentTerm {
+		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
+		return
+	}
+	if args.LastIncludedIndex <= rf.lastIncludedIndex {
+		reply.Term = rf.currentTerm
+		rf.mu.Unlock()
+		return
+	}
+	if args.LastIncludedIndex > rf.getLastLogIndex() {
+		rf.log = make([]LogEntry, 1)
+		rf.log[0] = LogEntry{Term: args.LastIncludedTerm}
+	} else {
+		rf.log = rf.log[(args.LastIncludedIndex - rf.lastIncludedIndex):]
+	}
+	rf.currentTerm = args.LeaderTerm
+	rf.votedFor = -1
+	rf.state = Follower
+	rf.lastIncludedIndex = args.LastIncludedIndex
+	rf.resetElectionTimer()
+	if rf.commitIndex < rf.lastIncludedIndex {
+		rf.commitIndex = rf.lastIncludedIndex
+	}
+	if rf.lastApplied < rf.lastIncludedIndex {
+		rf.lastApplied = rf.lastIncludedIndex
+	}
+	rf.persist()
+	reply.Term = rf.currentTerm
+	rf.persister.SaveStateAndSnapshot(rf.persister.ReadRaftState(), args.Data)
+	rf.mu.Unlock()
+	rf.applyCh <- ApplyMsg{
+		Command:      nil,
+		CommandValid: false,
+		CommandIndex: args.LastIncludedIndex,
+		CommandTerm:  args.LeaderTerm,
+		SnapShot:     args.Data,
+	}
+}
+
+func (rf *Raft) sendInstallSnapshot(server int, args *InstallSnapshotArgs, reply *InstallSnapshotReply) bool {
+	ok := rf.peers[server].Call("Raft.InstallSnapshot", args, reply)
+	return ok
 }
 
 // the service or tester wants to create a Raft server. the ports

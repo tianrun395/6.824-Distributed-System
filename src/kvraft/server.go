@@ -1,6 +1,7 @@
 package kvraft
 
 import (
+	"bytes"
 	"log"
 	"sync"
 	"sync/atomic"
@@ -47,6 +48,7 @@ type KVServer struct {
 	maxraftstate int // snapshot if log grows this big
 
 	// Your definitions here.
+	persister           *raft.Persister
 	database            map[string]string
 	waitCh              map[int]chan Op
 	lastRequestByClient map[int64]LastRequestInfo
@@ -141,6 +143,8 @@ func (kv *KVServer) raftWaitorAndApplier() {
 	for {
 		cmd := <-kv.applyCh
 		if cmd.CommandValid == false {
+			// this is a snapshot, need to read snapshot and update state machine.
+			kv.RestoreFromSnapShot(cmd.SnapShot)
 			continue
 		}
 		commandIndex := cmd.CommandIndex
@@ -168,6 +172,15 @@ func (kv *KVServer) raftWaitorAndApplier() {
 			case "Append":
 				kv.database[op.Key] += op.Value
 				kv.lastRequestByClient[op.ClientId] = LastRequestInfo{SeqNumber: op.SeqNumber, Op: op, Reply: PutAppendReply{Err: OK}}
+			}
+			if kv.maxraftstate != -1 && kv.persister.RaftStateSize() > kv.maxraftstate {
+				// need to snapshot
+				w := new(bytes.Buffer)
+				e := labgob.NewEncoder(w)
+				e.Encode(kv.database)
+				e.Encode(kv.lastRequestByClient)
+				snapshot := w.Bytes()
+				kv.rf.SnapshotAndDiscardLogs(commandIndex, snapshot)
 			}
 		}
 		if ch, exists := kv.waitCh[commandIndex]; exists {
@@ -199,6 +212,28 @@ func (kv *KVServer) killed() bool {
 	return z == 1
 }
 
+func (kv *KVServer) RestoreFromSnapShot(snapshot []byte) {
+	kv.mu.Lock()
+	if snapshot != nil && len(snapshot) > 0 {
+		r := bytes.NewBuffer(snapshot)
+		d := labgob.NewDecoder(r)
+		var database map[string]string
+		var lastRequestByClient map[int64]LastRequestInfo
+		if d.Decode(&database) != nil || d.Decode(&lastRequestByClient) != nil {
+			log.Fatalf("Failed to read snapshot, maybe due to wrong snapshot format")
+			kv.database = make(map[string]string)
+			kv.lastRequestByClient = make(map[int64]LastRequestInfo)
+		} else {
+			kv.database = database
+			kv.lastRequestByClient = lastRequestByClient
+		}
+	} else {
+		kv.database = make(map[string]string)
+		kv.lastRequestByClient = make(map[int64]LastRequestInfo)
+	}
+	kv.mu.Unlock()
+}
+
 // servers[] contains the ports of the set of
 // servers that will cooperate via Raft to
 // form the fault-tolerant key/value service.
@@ -215,18 +250,21 @@ func StartKVServer(servers []*labrpc.ClientEnd, me int, persister *raft.Persiste
 	// call labgob.Register on structures you want
 	// Go's RPC library to marshall/unmarshall.
 	labgob.Register(Op{})
+	labgob.Register(GetReply{})
+	labgob.Register(PutAppendReply{})
+	labgob.Register(LastRequestInfo{})
 
 	kv := new(KVServer)
 	kv.me = me
 	kv.maxraftstate = maxraftstate
 
 	// You may need initialization code here.
+	kv.persister = persister
 	kv.mu = sync.Mutex{}
-	kv.database = make(map[string]string)
 	kv.dead = 0
 	kv.waitCh = make(map[int]chan Op)
-	kv.lastRequestByClient = make(map[int64]LastRequestInfo)
-
+	snapshot := kv.persister.ReadSnapshot()
+	kv.RestoreFromSnapShot(snapshot)
 	kv.applyCh = make(chan raft.ApplyMsg)
 	kv.rf = raft.Make(servers, me, persister, kv.applyCh)
 
