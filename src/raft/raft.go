@@ -445,7 +445,7 @@ func (rf *Raft) replicateToPeer(i int) {
 			rf.mu.Unlock()
 			break
 		} else {
-			rf.nextIndex[i] = max(rf.lastIncludedIndex+1, rf.nextIndex[i]-1)
+			rf.nextIndex[i] = max(1, rf.nextIndex[i]-1)
 			rf.mu.Unlock()
 		}
 	}
